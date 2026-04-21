@@ -1,4 +1,4 @@
-from simpy_networkx.new_simulator import *
+from new_simulator import *
 import simpy
 
 if __name__ == "__main__":
