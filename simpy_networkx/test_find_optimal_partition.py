@@ -1,5 +1,7 @@
-from simulator import *
+from simulator_multiple_source import Simulator, activation_size_bytes
+import simpy
 import pandas as pd
+import json
 
 def generate_partitions(n):
     """Generate all contiguous partitions of n layers"""
@@ -113,8 +115,9 @@ if __name__=="__main__":
     # print(paths)
 
     results = []
+    queue_details_rows = []
 
-    for partition in partitions:
+    for partition_id, partition in enumerate(partitions):
         k = len(partition)
 
         # skip if more partitions than devices
@@ -138,7 +141,9 @@ if __name__=="__main__":
             linksBandwidth          = links_bw,
             env                     = env,
             arrival_rate            = 0.2,
-            sim_duration            = sim_duration
+            sim_duration            = sim_duration,
+            task_generating_device_ids=[0],
+            input_task_size         = activation_size_bytes([1,3,32,32])
         )
     
         sim.simulate()
@@ -146,20 +151,69 @@ if __name__=="__main__":
         res = sim.results()
         print(res)
 
+        stage_metrics = res.get("stage_metrics", {})
+
+        # Active devices only: devices present in the partition mapping
+        active_device_queue_map = {}
+        for device_idx in sorted(mapping.keys()):
+            metric_key = f"device_{device_idx}"
+            if metric_key in stage_metrics:
+                metric_val = stage_metrics[metric_key]
+                active_device_queue_map[str(device_idx)] = metric_val["mean_queue_length"]
+
+                queue_details_rows.append({
+                    "partition_id": partition_id,
+                    "partition": str(mapping),
+                    "num_devices": k,
+                    "entity_type": "device",
+                    "entity_id": str(device_idx),
+                    "entity_label": metric_key,
+                    "mean_queue_length": metric_val["mean_queue_length"],
+                    "tasks_processed": metric_val["tasks_processed"],
+                    "utilization": metric_val["utilization"],
+                })
+
+        # Used links only: links with at least one task processed
+        used_link_queue_map = {}
+        for metric_key, metric_val in stage_metrics.items():
+            if metric_key.startswith("link_") and metric_val.get("tasks_processed", 0) > 0:
+                used_link_queue_map[metric_key] = metric_val["mean_queue_length"]
+
+                queue_details_rows.append({
+                    "partition_id": partition_id,
+                    "partition": str(mapping),
+                    "num_devices": k,
+                    "entity_type": "link",
+                    "entity_id": metric_key.replace("link_", "", 1),
+                    "entity_label": metric_key,
+                    "mean_queue_length": metric_val["mean_queue_length"],
+                    "tasks_processed": metric_val["tasks_processed"],
+                    "utilization": metric_val["utilization"],
+                })
+
         results.append({
+            "partition_id": partition_id,
             "partition": mapping,
             "num_devices": k,
             "mean_latency": res["mean_latency"],
+            "compute_delay": res["mean_compute_delay"],
+            "communication_delay": res["mean_communication_delay"],
             "p95_latency": res["p95_latency"],
             "bottleneck": res["bottleneck_partition"],
             "util": res["max_utilization"],
             "mean_compute_queue":  res["mean_compute_queue"],
             "mean_comm_queue":     res["mean_comm_queue"],
             "mean_overall_queue":  res["mean_overall_queue"],
+            "active_device_mean_queue_map": json.dumps(active_device_queue_map),
+            "used_link_mean_queue_map": json.dumps(used_link_queue_map),
         })
     
     print(results)
     df = pd.DataFrame(results)
     print(df)
-    df.to_csv("results.csv")
+    df.to_csv("results2_3.csv", index=False)
+
+    # Long-format queue detail rows for direct filtering and bar-plotting
+    df_queue_details = pd.DataFrame(queue_details_rows)
+    df_queue_details.to_csv("results_queue_details_2_3.csv", index=False)
     # return results

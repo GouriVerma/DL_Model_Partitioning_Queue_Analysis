@@ -87,7 +87,7 @@ if __name__=="__main__":
         linksBandwidth          = links_bw,
         env                     = env,
         arrival_rate            = 0.2,
-        sim_duration            = 1000,
+        sim_duration            = sim_duration,
         sampling_interval       = 1,
         task_generating_device_ids = [0, 15],
         input_task_size         = activation_size_bytes([1,3,32,32]),

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 
 import logging
-logging.basicConfig(filename='simulator_multi_source_p.log', level=logging.DEBUG, filemode='w')
+logging.basicConfig(filename='simulator_multi_source.log', level=logging.DEBUG, filemode='w')
 
 def normalize_edge(u, v):
     return tuple(sorted([u, v]))
@@ -17,12 +17,14 @@ def activation_size_bytes(shape, dtype_bytes=4):
 @dataclass
 class TaskRecord:
     """Stores timing breakdowns for one completed task."""
-    task_id:          int
-    arrival_time:     float
-    origin:           Tuple[int, int] = (0,0)
-    completion_time:  float = 0.0
+    task_id:                int
+    arrival_time:           float
+    origin:                 Tuple[int, int] = (0,0)
+    completion_time:        float = 0.0
     # per-partition: (partition_idx, compute_wait, compute_service, tx_wait, tx_service)
-    stage_breakdown:  List[Tuple] = field(default_factory=list)
+    stage_breakdown:        List[Tuple] = field(default_factory=list)
+    compute_delay:          float = 0.0
+    communication_delay:    float = 0.0
  
     @property
     def total_latency(self):
@@ -83,6 +85,7 @@ class Link:
             logging.info(f"Message gets the link resource for task {message.task_id} at {self.env.now}")
             yield self.env.timeout(delay)
             self.busy_time += delay  # Add actual transmission time
+            message.communication_delay += delay
             yield self.transmission_queue.put(message)
 
     def put(self, message_size, message):
@@ -93,7 +96,7 @@ class Link:
 
 class Simulator:
 
-    def __init__(self, numLayers, layersFlops, layersActivationSize, gridSize, deviceToPartitionMapping, deviceComputeCapacity, linksBandwidth, env, arrival_rate=1, default_bw=1, sim_duration=50, sampling_interval=1, task_generating_device_ids=None, input_task_size=32, global_poisson_stream=False):
+    def __init__(self, numLayers, layersFlops, layersActivationSize, gridSize, deviceToPartitionMapping, deviceComputeCapacity, linksBandwidth, env, arrival_rate=1, default_bw=1, sim_duration=50, sampling_interval=1, task_generating_device_ids=None, input_task_size=32, global_poisson_stream=False, random_seed: Optional[int]=None):
         self.numLayers = numLayers
         self.layerFlops = layersFlops
         self.layersActivationSize = layersActivationSize
@@ -108,6 +111,8 @@ class Simulator:
         self.nextTaskId = 0
         self.initialTaskMessageSize = input_task_size
         self.globalPoissonStream = global_poisson_stream # False then each device in the task_generating_device_ids generates task independently in its tasks queue, if true; global poisson stream is used to generate task and put into the queue of any of the device in task generating devices
+        self.randomSeed = random_seed
+        self.rng = np.random.default_rng(self.randomSeed)
 
         self.env = env
 
@@ -182,11 +187,11 @@ class Simulator:
         """
         while True:
             # Exponential inter-arrival time (global Poisson process)
-            inter_arrival = np.random.exponential(1.0 / self.arrivalRate)
+            inter_arrival = self.rng.exponential(1.0 / self.arrivalRate)
             yield self.env.timeout(inter_arrival)
             
             # Randomly select a source device for this task
-            source_device_idx = np.random.choice(self.taskGeneratingDeviceIds)
+            source_device_idx = self.rng.choice(self.taskGeneratingDeviceIds)
             source_device_coord = self.get_device_coord(source_device_idx)
             source_device = self.grid.nodes[source_device_coord]["device"]
             
@@ -245,7 +250,7 @@ class Simulator:
 
             while True:
                 # Exponential inter-arrival time (Poisson process)
-                inter_arrival = np.random.exponential(1.0 / self.arrivalRate)
+                inter_arrival = self.rng.exponential(1.0 / self.arrivalRate)
                 yield self.env.timeout(inter_arrival)
                 
                 # Put generated task into source device's generated tasks queue
@@ -305,6 +310,7 @@ class Simulator:
                 # self.stage_metrics_device[device_idx].total_wait_time += wait_time
                 self.stage_metrics_device[device_idx].tasks_processed += 1
                 self.stage_metrics_device[device_idx].busy_time += total_flops/self.deviceComputeCapacity[device_idx]
+                task.compute_delay += total_flops/self.deviceComputeCapacity[device_idx]
                 logging.info(f"Device {device_idx}: Computed task {task.task_id}  at {self.env.now}")
                 
                 # Send output to next device if not the last one
@@ -385,6 +391,8 @@ class Simulator:
             return {"error": "no tasks completed"}
  
         latencies = [r.total_latency for r in completed]
+        compute_delays = [r.compute_delay for r in completed]
+        communication_delays = [r.communication_delay for r in completed]
  
         stage_summary = {}
         for p, sm in self.stage_metrics_device.items():
@@ -449,6 +457,8 @@ class Simulator:
         "mean_latency":        float(np.mean(latencies)),
         "p95_latency":         float(np.percentile(latencies, 95)),
         "max_latency":         float(np.max(latencies)),
+        "mean_compute_delay":  float(np.mean(compute_delays)),
+        "mean_communication_delay":  float(np.mean(communication_delays)),
         "bottleneck_partition": bottleneck,
         "max_utilization":     stage_summary[bottleneck]["utilization"],
         "mean_compute_queue":  mean_compute_queue,
@@ -490,7 +500,8 @@ if __name__ == "__main__":
         sampling_interval       = 1,
         task_generating_device_ids = [0, 2],
         input_task_size         = 5,
-        global_poisson_stream   = True
+        global_poisson_stream   = False,
+        random_seed             = 42,
     )
  
     sim.simulate()
