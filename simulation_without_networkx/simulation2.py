@@ -26,15 +26,16 @@ import random
 # ─────────────────────────────────────────────────────────
 
 LAYERS = [
-    {"name": "Conv-1",   "flops_M":   8.0},
-    {"name": "Conv-2",   "flops_M":  16.0},
-    {"name": "Conv-3",   "flops_M":  32.0},
-    {"name": "Conv-4",   "flops_M":  16.0},
-    {"name": "Conv-5",   "flops_M":   8.0},
-    {"name": "BiLSTM-1", "flops_M": 120.0},
-    {"name": "BiLSTM-2", "flops_M": 120.0},
-    {"name": "BiLSTM-3", "flops_M":  80.0},
+    {"name": "Conv-1",   "flops_M": 8.0,   "act_KB": 64.0},
+    {"name": "Conv-2",   "flops_M": 16.0,  "act_KB": 32.0},
+    {"name": "Conv-3",   "flops_M": 32.0,  "act_KB": 16.0},
+    {"name": "Conv-4",   "flops_M": 16.0,  "act_KB":  8.0},
+    {"name": "Conv-5",   "flops_M":  8.0,  "act_KB":  4.0},
+    {"name": "BiLSTM-1", "flops_M": 120.0, "act_KB": 16.0},
+    {"name": "BiLSTM-2", "flops_M": 120.0, "act_KB":  8.0},
+    {"name": "BiLSTM-3", "flops_M":  80.0, "act_KB":  4.0},
 ]
+
 
 # ─────────────────────────────────────────────────────────
 # SECTION 2 — SIMULATION PARAMETERS
@@ -42,7 +43,7 @@ LAYERS = [
 
 TOTAL_DEVICES  = 80       # 10 rows x 8 cols grid
 COMPUTE_GFLOPS = 0.5      # per-device compute capacity (GFLOPS)
-LAMBDA         = 20.0      # default task arrival rate (tasks/sec)
+LAMBDA         = 50.0      # default task arrival rate (tasks/sec)
 SIM_TIME       = 500.0    # SimPy simulation duration (seconds)
 RANDOM_SEED    = 42
 
