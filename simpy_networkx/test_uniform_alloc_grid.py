@@ -70,7 +70,7 @@ if __name__=="__main__":
             if j < grid_cols - 1:
                 links_bw[((i, j), (i, j+1))] = 1e6/8  # Horizontal links, bandwidth converted from bps => Bytes per second
     
-    sim_duration = 5000
+    sim_duration = 1000
     partition = [[0,1,2],[3,4],[5],[6],[7]]
     mapping = generate_uniform_interleaved_mapping(partition, grid_rows, grid_cols)
     # validate_partition_hops(mapping, grid_rows, grid_cols, len(partition))
@@ -86,14 +86,14 @@ if __name__=="__main__":
         deviceComputeCapacity   = device_caps,
         linksBandwidth          = links_bw,
         env                     = env,
-        arrival_rate            = 0.2,
+        arrival_rate            = 0.5,
         sim_duration            = sim_duration,
         sampling_interval       = 1,
-        task_generating_device_ids = [0, 15],
+        task_generating_device_ids = list(range(num_devices)),
         input_task_size         = activation_size_bytes([1,3,32,32]),
         global_poisson_stream   = False,
         random_seed             = 42,
-        next_device_assignment_policy='nn'
+        next_device_assignment_policy='leastload'
     )
  
     sim.simulate()
