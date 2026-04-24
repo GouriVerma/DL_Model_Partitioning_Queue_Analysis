@@ -2,10 +2,10 @@ import simpy
 import networkx
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 
 import logging
-logging.basicConfig(filename='simulator_multi_source.log', level=logging.DEBUG, filemode='w')
+logging.basicConfig(filename='simulator_rgg.log', level=logging.DEBUG, filemode='w')
 
 def normalize_edge(u, v):
     return tuple(sorted([u, v]))
@@ -14,17 +14,35 @@ def activation_size_bytes(shape, dtype_bytes=4):
     num_elements = np.prod(shape)
     return (num_elements * dtype_bytes)
 
+def build_rgg(n_nodes: int = 100, radius: float = 0.9, seed: int = 42, sqarea_side_len = 1) -> tuple[networkx.Graph, np.ndarray]:
+    """
+    Build a Random Geometric Graph.
+    Nodes are placed uniformly in [0,1]^2; edges connect pairs within `radius`.
+    Retries with slightly larger radius until the graph is connected.
+    Returns (graph, positions array of shape [n, 2]).
+    """
+    rng = np.random.default_rng(seed)
+    r = radius
+    for _ in range(20):
+        pos_array = rng.uniform(0, sqarea_side_len, size=(n_nodes, 2))
+        G = networkx.random_geometric_graph(n_nodes, r, pos=dict(enumerate(map(tuple, pos_array))), seed=seed)
+        if networkx.is_connected(G):
+            return G, pos_array
+        r *= 1.05
+    raise RuntimeError(f"Could not build a connected RGG after 20 retries (final r={r:.3f})")
+
 @dataclass
 class TaskRecord:
     """Stores timing breakdowns for one completed task."""
     task_id:                int
     arrival_time:           float
-    origin:                 Tuple[int, int] = (0,0)
+    origin:                 Union[int, Tuple[int, int]] = 0
     completion_time:        float = 0.0
     # per-partition: (partition_idx, compute_wait, compute_service, tx_wait, tx_service)
     stage_breakdown:        List[Tuple] = field(default_factory=list)
     compute_delay:          float = 0.0
     communication_delay:    float = 0.0
+    next_partition_idx:     int = 0
  
     @property
     def total_latency(self):
@@ -96,51 +114,73 @@ class Link:
 
 class Simulator:
 
-    def __init__(self, numLayers, layersFlops, layersActivationSize, gridSize, deviceToPartitionMapping, deviceComputeCapacity, linksBandwidth, env, arrival_rate=1, default_bw=1, sim_duration=50, sampling_interval=1, task_generating_device_ids=None, input_task_size=32, global_poisson_stream=False, random_seed: Optional[int]=None):
+    def __init__(self, numLayers, layersFlops, layersActivationSize, numNodes, deviceToPartitionMapping, deviceComputeCapacity, env, partition: Optional[Union[Dict[int, List[int]], List[List[int]]]]=None, arrival_rate=1, default_bw=1, sim_duration=50, sampling_interval=1, task_generating_device_ids=None, input_task_size=32, global_poisson_stream=False, random_seed: Optional[int]=None, next_device_assignment_policy="random", next_device_random_seed: Optional[int]=None, rgg_random_seed: Optional[int]=None, comm_radius=0.1, sqarea_side_len=1):
         self.numLayers = numLayers
         self.layerFlops = layersFlops
         self.layersActivationSize = layersActivationSize
-        self.gridSize = gridSize
-        self.deviceToPartitionMapping = deviceToPartitionMapping # {device ID: [list of layers]}, [list of layers] partitions are given sequentially in the order
+        # self.gridSize = gridSize
         self.deviceComputeCapacity = deviceComputeCapacity # Rowwise 1D array
-        self.linksBandwidth = linksBandwidth # Link to Bandwidth dictionary
+
+        self.partitions = self._normalize_partitions(partition, deviceToPartitionMapping)
+        self.numPartitions = len(self.partitions)
+        self.deviceToPartitionMapping = self._normalize_device_partition_mapping(deviceToPartitionMapping) # {device_id: [partition_idx, ...]}
+        self.partitionToDevices = self._build_partition_to_devices(self.deviceToPartitionMapping)
+        self.partitionFlops = {
+            p_idx: sum(self.layerFlops[layer_idx] for layer_idx in layers)
+            for p_idx, layers in self.partitions.items()
+        }
+        
         self.arrivalRate = arrival_rate
         self.simDuration = sim_duration
         self.samplingInterval = sampling_interval
         self.taskGeneratingDeviceIds = task_generating_device_ids
         self.nextTaskId = 0
+        self.totalTasksGenerated = 0
         self.initialTaskMessageSize = input_task_size
         self.globalPoissonStream = global_poisson_stream # False then each device in the task_generating_device_ids generates task independently in its tasks queue, if true; global poisson stream is used to generate task and put into the queue of any of the device in task generating devices
         self.randomSeed = random_seed
         self.rng = np.random.default_rng(self.randomSeed)
-
+        self.nextDeviceAssignmentPolicy = next_device_assignment_policy
+        self.nextDeviceRandomSeed = next_device_random_seed if next_device_random_seed is not None else self.randomSeed
+        self.nextDeviceRng = np.random.default_rng(self.nextDeviceRandomSeed)
+        self.rggRandomSeed = rgg_random_seed if rgg_random_seed is not None else self.randomSeed
         self.env = env
+        self.sqareaSideLen = sqarea_side_len
+
+        self._rr_counter: Dict[int, int] = {p: 0 for p in range(self.numPartitions)}
 
         # Initialise Grid
-        self.grid = networkx.grid_2d_graph(gridSize[0], gridSize[1])
+        # self.grid = networkx.grid_2d_graph(gridSize[0], gridSize[1])
+        self.commRadius = comm_radius
+        # self.grid = networkx.random_geometric_graph(numNodes,comm_radius,seed=self.rggRandomSeed)
+        # if not networkx.is_connected(self.grid):
+        #     raise ValueError(
+        #         "Random geometric graph is disconnected. "
+        #         "Increase comm_radius, change rgg_random_seed, or use a larger numNodes."
+        #     )
+        self.grid, self.pos_array = build_rgg(numNodes, comm_radius, self.rggRandomSeed, self.sqareaSideLen)
+        # print(list(self.grid.edges()))
 
         # Initialise Devices
         for idx, coord in enumerate(list(self.grid.nodes)):
             self.grid.nodes[coord]["device"] = Device(compute_cap=deviceComputeCapacity[idx], env=self.env)
     
         # Initialise Links
-        # for edge in linksBandwidth:
-        #     self.grid.edges[edge]["link"] = Link(bandwidth=linksBandwidth[edge], env = self.env)
         for edge in self.grid.edges:
-            bw = linksBandwidth.get(edge, default_bw)
-            self.grid.edges[edge]["link"] = Link(bw, env)
+            self.grid.edges[edge]["link"] = Link(default_bw, env)
         
-        # Create reverse mapping: layer -> device
-        self.layer_to_device = {}
-        for device_idx, layers in self.deviceToPartitionMapping.items():
+        # Create reverse mapping: layer -> partition
+        self.layer_to_partition = {}
+        for p_idx, layers in self.partitions.items():
             for layer in layers:
-                self.layer_to_device[layer] = device_idx
+                self.layer_to_partition[layer] = p_idx
         
         # Log the device to partition mapping with coordinates
         logging.info("Device to Partition Mapping:")
-        for device_idx, layers in self.deviceToPartitionMapping.items():
+        for device_idx, partition_idx in self.deviceToPartitionMapping.items():
             coord = self.get_device_coord(device_idx)
-            logging.info(f"  Device {device_idx} at {coord}: layers {layers}")
+            layers = self.partitions[partition_idx]
+            logging.info(f"  Device {device_idx} at {coord}: partition {partition_idx}, layers {layers}")
         
         
         # Create edges to index dict
@@ -158,9 +198,8 @@ class Simulator:
             p: StageMetrics(partition_idx=p) for p in range(self.grid.number_of_edges())
         }
 
-        self.first_partition_device_idx = next(iter(self.deviceToPartitionMapping.keys()))
         if self.taskGeneratingDeviceIds is None:
-            self.taskGeneratingDeviceIds = [self.first_partition_device_idx]
+            self.taskGeneratingDeviceIds = [0]
 
         # first_device_layers = self.deviceToPartitionMapping[self.first_partition_device_idx]
         # first_layer_idx = min(first_device_layers) if first_device_layers else 0
@@ -169,6 +208,87 @@ class Simulator:
         for device_idx in self.taskGeneratingDeviceIds:
             if device_idx < 0 or device_idx >= len(self.grid.nodes):
                 raise ValueError(f"Invalid task generating device id: {device_idx}")
+
+    def _normalize_partitions(self, partition_input, device_to_partition_input):
+        """
+        Normalize partition definition to {partition_idx: [layer_idx, ...]} with sequential partition_idx.
+        Accepts:
+          - dict like {0:[0,1], 1:[2,3]}
+          - list like [[0,1], [2,3]]
+        If not provided, attempts backward-compatible inference from device mapping values if they look like layer lists.
+        """
+        if partition_input is None:
+            if not isinstance(device_to_partition_input, dict):
+                raise ValueError("partition must be provided when deviceToPartitionMapping is not a dict")
+            inferred = []
+            seen = set()
+            for _, value in sorted(device_to_partition_input.items(), key=lambda x: x[0]):
+                if isinstance(value, int):
+                    continue
+                if isinstance(value, list) and value and all(isinstance(x, int) for x in value):
+                    key = tuple(value)
+                    if key not in seen:
+                        seen.add(key)
+                        inferred.append(list(value))
+            if not inferred:
+                raise ValueError("Could not infer partitions. Provide partition input explicitly.")
+            partition_input = inferred
+
+        if isinstance(partition_input, dict):
+            ordered = [list(partition_input[k]) for k in sorted(partition_input.keys())]
+        elif isinstance(partition_input, list):
+            ordered = [list(p) for p in partition_input]
+        else:
+            raise ValueError("partition must be either dict[int, list[int]] or list[list[int]]")
+
+        partitions = {idx: layers for idx, layers in enumerate(ordered)}
+        for idx, layers in partitions.items():
+            if not layers:
+                raise ValueError(f"Partition {idx} is empty")
+            if not all(isinstance(layer, int) for layer in layers):
+                raise ValueError(f"Partition {idx} contains non-integer layer IDs")
+        return partitions
+
+    def _normalize_device_partition_mapping(self, mapping_input):
+        """
+        Normalize device mapping to {device_id: partition_idx}.
+        Each device holds exactly one partition.
+        Accepts mapping values as:
+          - partition id (integer), e.g. 0, 1, 2
+        """
+        if not isinstance(mapping_input, dict):
+            raise ValueError("deviceToPartitionMapping must be a dict")
+
+        partition_ids = set(self.partitions.keys())
+        normalized = {}
+
+        for device_idx, partition_idx in mapping_input.items():
+            if device_idx < 0 or device_idx >= len(self.deviceComputeCapacity):
+                raise ValueError(f"Invalid device id in mapping: {device_idx}")
+
+            if not isinstance(partition_idx, int):
+                raise ValueError(
+                    f"Device {device_idx} mapping must be a partition index (integer), got {type(partition_idx).__name__}"
+                )
+
+            if partition_idx not in partition_ids:
+                raise ValueError(f"Device {device_idx} references unknown partition {partition_idx}")
+
+            normalized[device_idx] = partition_idx
+
+        return normalized
+
+    def _build_partition_to_devices(self, device_to_partition):
+        """Build reverse mapping: partition_idx -> list of device_ids that hold it."""
+        partition_to_devices = {p: [] for p in self.partitions.keys()}
+        for device_idx, partition_idx in device_to_partition.items():
+            partition_to_devices[partition_idx].append(device_idx)
+
+        missing = [p for p, devices in partition_to_devices.items() if not devices]
+        if missing:
+            raise ValueError(f"No device assigned to partition(s): {missing}")
+
+        return partition_to_devices
     
     def get_device_coord(self, device_idx):
         """Get grid coordinate of device by its index."""
@@ -178,7 +298,92 @@ class Simulator:
     def _get_next_task_id(self):
         task_id = self.nextTaskId
         self.nextTaskId += 1
+        self.totalTasksGenerated += 1
         return task_id
+    
+    def _pick_replica(self, partition_idx: int) -> int:
+        """Return the device_idx of the chosen replica for *partition_idx*."""
+        replicas = self.partitionToDevicesMapping[partition_idx]
+        if len(replicas) == 1:
+            return replicas[0]
+
+        if self.dispatch_policy == "round_robin":
+            chosen = replicas[self._rr_counter[partition_idx] % len(replicas)]
+            self._rr_counter[partition_idx] += 1
+            return chosen
+
+        # Default: least_loaded (queue length + compute queue)
+        def load(dev_idx):
+            dev = self.get_device(dev_idx)
+            return len(dev.input_queue.items) + len(dev.compute_resource.queue)
+
+        loads = {dev_idx: load(dev_idx) for dev_idx in replicas}
+        min_load = min(loads.values())
+        candidates = [dev_idx for dev_idx, cur_load in loads.items() if cur_load == min_load]
+        chosen = candidates[self._rr_counter[partition_idx] % len(candidates)]
+        self._rr_counter[partition_idx] += 1
+        return chosen
+
+    def _select_next_device_for_partition(self, device_idx, next_partition_idx):
+        replicas = self.partitionToDevices[next_partition_idx]
+        if len(replicas) == 1:
+            return replicas[0]
+        
+        if self.nextDeviceAssignmentPolicy=="random":
+            next_device_idx = int(self.nextDeviceRng.choice(self.partitionToDevices[next_partition_idx]))
+            return next_device_idx
+        elif self.nextDeviceAssignmentPolicy=="nn":
+            next_partition_devices = self.partitionToDevices[next_partition_idx]
+            current_coord = self.get_device_coord(device_idx)
+
+            # Choose device(s) with minimum hop distance from current device.
+            min_hops = None
+            nearest_devices = []
+            for candidate_device_idx in next_partition_devices:
+                candidate_coord = self.get_device_coord(candidate_device_idx)
+                try:
+                    hops = networkx.shortest_path_length(self.grid, source=current_coord, target=candidate_coord)
+                except networkx.NetworkXNoPath:
+                    continue
+
+                if (min_hops is None) or (hops < min_hops):
+                    min_hops = hops
+                    nearest_devices = [candidate_device_idx]
+                elif hops == min_hops:
+                    nearest_devices.append(candidate_device_idx)
+
+            if not nearest_devices:
+                raise ValueError(
+                    f"No reachable device found for next partition {next_partition_idx} from device {device_idx}."
+                )
+
+            # Tie-break among equally near devices in a reproducible way.
+            next_device_idx = int(self.nextDeviceRng.choice(nearest_devices))
+            return next_device_idx
+            
+        elif self.nextDeviceAssignmentPolicy=="rr":
+            chosen_device = replicas[self._rr_counter[next_partition_idx] % len(replicas)]
+            self._rr_counter[next_partition_idx] += 1
+            return chosen_device
+
+        elif self.nextDeviceAssignmentPolicy=="leastload":
+            def load(device_idx):
+                device_coord = self.get_device_coord(device_idx)
+                device = self.grid.nodes[device_coord]["device"]
+                return len(device.input_queue.items) + len(device.compute_resource.queue)
+
+            loads = {dev_idx: load(dev_idx) for dev_idx in replicas}
+            min_load = min(loads.values())
+            candidates = [dev_idx for dev_idx, cur_load in loads.items() if cur_load == min_load]
+            chosen = candidates[self._rr_counter[next_partition_idx] % len(candidates)]
+            # chosen = self.nextDeviceRng.choice(candidates)
+            self._rr_counter[next_partition_idx] += 1
+            return chosen
+        else:
+            print("Setting Next Device Assignment Policy to Default i.e Random")
+            next_device_idx = int(self.nextDeviceRng.choice(self.partitionToDevices[next_partition_idx]))
+            return next_device_idx
+        
 
     def _task_generator_global(self):
         """
@@ -206,10 +411,13 @@ class Simulator:
     
     def send_message(self, task, src_coord, dest_coord, message_size, dest_device):
         """Asynchronously transmit a task from source to destination through the shortest path."""
-        logging.info(f"Message for task {task.task_id} start sending from {src_coord} to {dest_coord} at {self.env.now}")
+        logging.info(f"Message for task {task.task_id} need to start sending from {src_coord} to {dest_coord} at {self.env.now}")
 
         # For Multihop
-        path = networkx.shortest_path(self.grid, src_coord, dest_coord)
+        try:
+            path = networkx.shortest_path(self.grid, src_coord, dest_coord)
+        except networkx.NetworkXNoPath as e:
+            raise ValueError(f"No route from {src_coord} to {dest_coord} for task {task.task_id}") from e
         
         current_task = task
         for i in range(len(path) - 1):
@@ -267,14 +475,18 @@ class Simulator:
             """Handle generated tasks for a device and route them to the first partition device."""
             device_coord = self.get_device_coord(device_idx)
             device = self.grid.nodes[device_coord]["device"]
-
-            first_device_idx = self.first_partition_device_idx
-            first_device_coord = self.get_device_coord(first_device_idx)
-            first_device = self.grid.nodes[first_device_coord]["device"]
+            first_partition_idx = 0
+            first_partition_devices = self.partitionToDevices[first_partition_idx]
 
             while True:
                 task = yield device.generated_tasks_queue.get()
                 logging.info(f"Device {device_idx}: Picked generated task {task.task_id} at {self.env.now}")
+
+                first_device_idx = self._select_next_device_for_partition(device_idx, 0)
+                # first_device_idx = int(self.rng.choice(first_partition_devices))
+                first_device_coord = self.get_device_coord(first_device_idx)
+                first_device = self.grid.nodes[first_device_coord]["device"]
+                task.next_partition_idx = 0
 
                 if device_idx == first_device_idx:
                     yield device.input_queue.put(task)
@@ -293,13 +505,22 @@ class Simulator:
             """Worker process that handles tasks on a specific device."""
             device_coord = self.get_device_coord(device_idx)
             device = self.grid.nodes[device_coord]["device"]
-            layers_on_device = self.deviceToPartitionMapping[device_idx]
-            total_flops = sum(self.layerFlops[layer_idx] for layer_idx in layers_on_device)
+            partition_idx = self.deviceToPartitionMapping.get(device_idx)
+            if partition_idx is None:
+                return
             
             while True:
                 # Get task from input buffer
                 task = yield device.input_queue.get()
                 logging.info(f"Device {device_idx}: Received task {task.task_id}  at {self.env.now}")
+
+                if task.next_partition_idx != partition_idx:
+                    raise RuntimeError(
+                        f"Task {task.task_id} reached device {device_idx}, but expects partition {task.next_partition_idx} (device holds partition {partition_idx})"
+                    )
+
+                layers_on_device = self.partitions[partition_idx]
+                total_flops = self.partitionFlops[partition_idx]
 
                 queue_length = len(device.input_queue.items)
                 logging.info(f"Device {device_idx} Queue Length {queue_length}")
@@ -313,12 +534,13 @@ class Simulator:
                 task.compute_delay += total_flops/self.deviceComputeCapacity[device_idx]
                 logging.info(f"Device {device_idx}: Computed task {task.task_id}  at {self.env.now}")
                 
-                # Send output to next device if not the last one
-                device_keys = list(self.deviceToPartitionMapping.keys())
-                current_device_position = device_keys.index(device_idx)
-                
-                if current_device_position < len(device_keys) - 1:
-                    next_device_idx = device_keys[current_device_position + 1]
+                # Send output to next partition if not the last one
+                task.next_partition_idx += 1
+
+                if task.next_partition_idx < self.numPartitions:
+                    next_partition_idx = task.next_partition_idx
+                    # next_device_idx = int(self.rng.choice(self.partitionToDevices[next_partition_idx]))
+                    next_device_idx = self._select_next_device_for_partition(device_idx, next_partition_idx)
                     next_device_coord = self.get_device_coord(next_device_idx)
                     next_device = self.grid.nodes[next_device_coord]["device"]
                     
@@ -347,8 +569,8 @@ class Simulator:
                     link = self.grid.edges[edge]["link"]
                     # queue_len = len(link.linkResource.queue)
                     queue_len = (
-                        len(link.linkResource.queue) +     # waiting for transmission
-                        len(link.transmission_queue.items) # finished transmission but not consumed
+                        len(link.linkResource.queue)     # waiting for transmission
+                        # + len(link.transmission_queue.items) # finished transmission but not consumed
                     )
                     self.stage_metrics_link[link_idx].queue_samples.append(queue_len)
                 # Sample device queues (unbiased)
@@ -373,8 +595,8 @@ class Simulator:
         for device_idx in range(len(self.grid.nodes)):
             self.env.process(generated_task_worker(device_idx))
         
-        # Start worker processes for each device
-        for device_idx in sorted(set(self.layer_to_device.values())):
+        # Start worker processes for each device that holds a partition
+        for device_idx in sorted(self.deviceToPartitionMapping.keys()):
             self.env.process(device_worker(device_idx))
         
         self.env.process(periodic_sampler())  
@@ -453,6 +675,7 @@ class Simulator:
  
         return {
         "stage_metrics":       stage_summary,
+        "total_tasks_generated": self.totalTasksGenerated,
         "tasks_completed":     len(completed),
         "mean_latency":        float(np.mean(latencies)),
         "p95_latency":         float(np.percentile(latencies, 95)),
@@ -475,13 +698,16 @@ if __name__ == "__main__":
         30,40
     ]
  
-    # 2x2 grid = 4 devices
-    grid_rows, grid_cols = 2, 2
-    num_devices = grid_rows * grid_cols
+    # RGG with 4 nodes
+    num_devices = 100
 
-    links_bw = {((0, 0), (1, 0)) : 5, ((0, 0), (0, 1)): 5, ((0, 1), (1, 1)): 5, ((1, 0), (1, 1)): 5}
+    # For RGG, edge keys depend on generated topology; use default_bw unless explicitly mapping by node-id edge pairs.
+    links_bw = {}
     device_caps = [10, 10, 10, 10]  # capacity for all 4 devices
-    device_to_partition = {0:[0], 1:[1]}
+    device_caps = [10]*num_devices
+    # print(device_caps)
+    partition = [[0], [1]] # list of list of layers in partition
+    device_to_partition = {0: 0, 1: 1}  # device_id: partition_idx
     
     sim_duration = 1000
 
@@ -490,18 +716,22 @@ if __name__ == "__main__":
         numLayers               = len(layer_flops),  # Fixed: use actual number of layers
         layersFlops             = layer_flops,
         layersActivationSize    = layer_activation,
-        gridSize                = (grid_rows, grid_cols),
+        numNodes                = num_devices,
+        partition               = partition,
         deviceToPartitionMapping= device_to_partition,
         deviceComputeCapacity   = device_caps,
-        linksBandwidth          = links_bw,
         env                     = env,
         arrival_rate            = 0.2,
-        sim_duration            = 1000,
+        sim_duration            = sim_duration,
         sampling_interval       = 1,
-        task_generating_device_ids = [0, 2],
+        task_generating_device_ids = [0,54,90],
         input_task_size         = 5,
         global_poisson_stream   = False,
         random_seed             = 42,
+        next_device_assignment_policy='nn',
+        default_bw              = 5,
+        comm_radius             = 0.9,
+        rgg_random_seed         = 42,
     )
  
     sim.simulate()

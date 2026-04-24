@@ -398,13 +398,9 @@ def analyse(output_dir = "plots/",results_csv="results.csv",results_queue_detail
     plot_comm_queue_vs_dev_count()
     optimal_partition_id =  plot_min_overall_queue_vs_dev_count()
     plot_min_latency_vs_dev_count()
-    # plot_min_communication_delay_vs_dev_count()
-    # plot_min_compute_delay_vs_dev_count()
 
-    # Set this partition_id explicitly to plot per-device/per-link queue bars.
-    # Example: 0, 10, 25, ...
     partition_id_to_plot = optimal_partition_id
     plot_device_mean_queue_bar_for_partition(partition_id_to_plot)
     plot_link_mean_queue_bar_for_partition(partition_id_to_plot)
 
-analyse("plots/multi_source_code_2","results2_2.csv","results_queue_details.csv")
+analyse("plots/","results.csv","results_queue_details.csv")

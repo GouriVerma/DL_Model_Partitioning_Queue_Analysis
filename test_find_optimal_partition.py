@@ -140,7 +140,7 @@ if __name__=="__main__":
             deviceComputeCapacity   = device_caps,
             linksBandwidth          = links_bw,
             env                     = env,
-            arrival_rate            = 0.2,
+            arrival_rate            = 0.5,
             sim_duration            = sim_duration,
             task_generating_device_ids=[0],
             input_task_size         = activation_size_bytes([1,3,32,32])
@@ -211,9 +211,9 @@ if __name__=="__main__":
     print(results)
     df = pd.DataFrame(results)
     print(df)
-    df.to_csv("results2_3.csv", index=False)
+    df.to_csv("results.csv", index=False)
 
     # Long-format queue detail rows for direct filtering and bar-plotting
     df_queue_details = pd.DataFrame(queue_details_rows)
-    df_queue_details.to_csv("results_queue_details_2_3.csv", index=False)
+    df_queue_details.to_csv("results_queue_details.csv", index=False)
     # return results

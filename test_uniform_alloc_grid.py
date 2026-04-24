@@ -1,4 +1,4 @@
-from simulator_multiple_devices_per_partition_multiple_sources import *
+from simulator_grid import *
 
 def generate_uniform_interleaved_mapping(partition, grid_rows, grid_cols):
     num_partitions = len(partition)

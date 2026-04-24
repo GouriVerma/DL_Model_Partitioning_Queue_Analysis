@@ -1,4 +1,4 @@
-from new_simulator import *
+from simulator_forward_backward_lstm_split import *
 import simpy
 
 if __name__ == "__main__":
@@ -153,7 +153,7 @@ if __name__ == "__main__":
         deviceComputeCapacity    = device_caps,
         linksBandwidth           = links_bw,
         env                      = env,
-        arrival_rate             = 0.2,
+        arrival_rate             = 0.5,
         sim_duration             = sim_duration,
         sampling_interval        = 1,
     )
@@ -166,7 +166,7 @@ if __name__ == "__main__":
     # ----------------------------------------------------------------
     # Pretty-print summary
     # ----------------------------------------------------------------
-    print("\n===== SIMULATION RESULTS =====")
+    print("\nSIMULATION RESULTS")
     print(f"Tasks completed  : {results['tasks_completed']}")
     print(f"Mean latency     : {results['mean_latency']:.4f}")
     print(f"P95  latency     : {results['p95_latency']:.4f}")

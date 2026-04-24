@@ -144,8 +144,8 @@ def plot_assignment(G: nx.Graph, pos_array: np.ndarray, assignment: dict[int, in
     pos = {n: tuple(pos_array[n]) for n in G.nodes()}
 
     fig, ax = plt.subplots(1, 1, figsize=(7, 6))
-    fig.patch.set_facecolor('#0d0d0d')
-    ax.set_facecolor('#0d0d0d')
+    fig.patch.set_facecolor("#fdfdfd")
+    ax.set_facecolor("#ffffff")
 
     node_colors = [colors[assignment[n]] for n in G.nodes()]
 
@@ -194,12 +194,6 @@ if __name__=="__main__":
     partition = [[0,1,2],[3,4],[5],[6],[7]]
     print(len(partition))
 
-    # rgg_graph = nx.random_geometric_graph(num_devices,comm_radius,seed=42)
-    # if not networkx.is_connected(rgg_graph):
-    #     raise ValueError(
-    #         "Random geometric graph is disconnected. "
-    #         "Increase comm_radius, change rgg_random_seed, or use a larger numNodes."
-    #     )
     rgg_graph, pos_array = build_rgg(num_devices, comm_radius, random_seed, sqarea_side_len)
 
     mapping = generate_uniform_interleaved_mapping_rgg(rgg_graph, len(partition))
@@ -216,25 +210,6 @@ if __name__=="__main__":
     
 
     env = simpy.Environment()
-    # # sim = Simulator(
-    # #     numLayers               = len(layer_flops),  # Fixed: use actual number of layers
-    # #     layersFlops             = layer_flops,
-    # #     layersActivationSize    = layer_activation,
-    # #     gridSize                = (grid_rows, grid_cols),
-    # #     partition               = partition,
-    # #     deviceToPartitionMapping= mapping,
-    # #     deviceComputeCapacity   = device_caps,
-    # #     linksBandwidth          = links_bw,
-    # #     env                     = env,
-    # #     arrival_rate            = 0.2,
-    # #     sim_duration            = sim_duration,
-    # #     sampling_interval       = 1,
-    # #     task_generating_device_ids = [0, 15],
-    # #     input_task_size         = activation_size_bytes([1,3,32,32]),
-    # #     global_poisson_stream   = False,
-    # #     random_seed             = 42,
-    # #     next_device_assignment_policy='nn'
-    # # )
 
     sim = Simulator(
         numLayers               = len(layer_flops),  # Fixed: use actual number of layers
@@ -244,7 +219,6 @@ if __name__=="__main__":
         partition               = partition,
         deviceToPartitionMapping= mapping,
         deviceComputeCapacity   = device_caps,
-        # linksBandwidth          = links_bw,
         env                     = env,
         arrival_rate            = 0.5,
         sim_duration            = sim_duration,

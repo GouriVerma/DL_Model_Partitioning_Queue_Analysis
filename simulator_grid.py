@@ -112,6 +112,7 @@ class Simulator:
             p_idx: sum(self.layerFlops[layer_idx] for layer_idx in layers)
             for p_idx, layers in self.partitions.items()
         }
+        self.totalTasksGenerated = 0
         
         self.linksBandwidth = linksBandwidth # Link to Bandwidth dictionary
         self.arrivalRate = arrival_rate
@@ -126,6 +127,7 @@ class Simulator:
         self.nextDeviceAssignmentPolicy = next_device_assignment_policy
         self.nextDeviceRandomSeed = next_device_random_seed if next_device_random_seed is not None else self.randomSeed
         self.nextDeviceRng = np.random.default_rng(self.nextDeviceRandomSeed)
+        self._rr_counter: Dict[int, int] = {p: 0 for p in range(self.numPartitions)}
 
         self.env = env
 
@@ -272,9 +274,14 @@ class Simulator:
     def _get_next_task_id(self):
         task_id = self.nextTaskId
         self.nextTaskId += 1
+        self.totalTasksGenerated += 1
         return task_id
 
     def _select_next_device_for_partition(self, device_idx, next_partition_idx):
+        replicas = self.partitionToDevices[next_partition_idx]
+        if len(replicas) == 1:
+            return replicas[0]
+        
         if self.nextDeviceAssignmentPolicy=="random":
             next_device_idx = int(self.nextDeviceRng.choice(self.partitionToDevices[next_partition_idx]))
             return next_device_idx
@@ -298,6 +305,25 @@ class Simulator:
             # Tie-break among equally near devices in a reproducible way.
             next_device_idx = int(self.nextDeviceRng.choice(nearest_devices))
             return next_device_idx
+        
+        elif self.nextDeviceAssignmentPolicy=="rr":
+            chosen_device = replicas[self._rr_counter[next_partition_idx] % len(replicas)]
+            self._rr_counter[next_partition_idx] += 1
+            return chosen_device
+
+        elif self.nextDeviceAssignmentPolicy=="leastload":
+            def load(device_idx):
+                device_coord = self.get_device_coord(device_idx)
+                device = self.grid.nodes[device_coord]["device"]
+                return len(device.input_queue.items) + len(device.compute_resource.queue)
+
+            loads = {dev_idx: load(dev_idx) for dev_idx in replicas}
+            min_load = min(loads.values())
+            candidates = [dev_idx for dev_idx, cur_load in loads.items() if cur_load == min_load]
+            chosen = candidates[self._rr_counter[next_partition_idx] % len(candidates)]
+            # chosen = self.nextDeviceRng.choice(candidates)
+            self._rr_counter[next_partition_idx] += 1
+            return chosen
             
         else:
             print("Setting Next Device Assignment Policy to Default i.e Random")
@@ -592,6 +618,7 @@ class Simulator:
  
         return {
         "stage_metrics":       stage_summary,
+        "total_tasks_generated": self.totalTasksGenerated,
         "tasks_completed":     len(completed),
         "mean_latency":        float(np.mean(latencies)),
         "p95_latency":         float(np.percentile(latencies, 95)),
