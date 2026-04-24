@@ -146,10 +146,7 @@ class Simulator:
         # Detect LSTM groups automatically by scanning device_keys in order.
         #
         # lstm_groups:   { fan_out_device_idx -> {"forward": dev, "backward": dev, "merge": dev} }
-        #   - The device immediately before a forward/backward/merge triple is the fan-out device.
-        #
-        # merge_sources: { merge_device_idx -> {"forward": dev, "backward": dev} }
-        #   - Used by the forward branch to know where to deliver the task.
+        # merge_sources: { merge_device_idx   -> {"forward": dev, "backward": dev} }
         # ----------------------------------------------------------------
         self.lstm_groups:   Dict[int, Dict[str, int]] = {}
         self.merge_sources: Dict[int, Dict[str, int]] = {}
@@ -193,8 +190,10 @@ class Simulator:
             for idx, (u, v) in enumerate(self.grid.edges())
         }
 
-        # join_buffer: {task_id: {"forward": bool, "backward": bool}}
-        self.join_buffer: Dict[int, Dict[str, bool]] = {}
+        # merge_buffer: { task_id -> int }
+        # Counts branch messages received at the merge device (h_fwd + h_bwd).
+        # When count reaches 2, both tensors are present and compute can begin.
+        self.merge_buffer: Dict[int, int] = {}
 
         self.task_records: List[TaskRecord] = []
         self.stage_metrics_device: Dict[int, StageMetrics] = {
@@ -211,7 +210,6 @@ class Simulator:
 
     # ------------------------------------------------------------------
     def get_device_coord(self, device_idx):
-        """Get grid coordinate of device by its index."""
         return list(self.grid.nodes)[device_idx]
 
     def send_message(self, task, src_coord, dest_coord, message_size, dest_device):
@@ -272,11 +270,17 @@ class Simulator:
                 )
 
                 # ------------------------------------------------------
-                # LSTM FORWARD branch
-                #   1. Compute
-                #   2. Flag join_buffer["forward"]
-                #   3. Send task to merge device  <-- forward is responsible
-                #   4. continue (skip generic pipeline-forward)
+                # LSTM FORWARD branch  (produces h_fwd)
+                #
+                # Real bidirectional LSTM: the forward pass processes the
+                # sequence left→right and produces hidden states h_fwd.
+                # These are a DIFFERENT tensor from h_bwd (produced by the
+                # backward pass) and both are required by the merge step.
+                #
+                # Steps:
+                #   1. Compute h_fwd
+                #   2. Send h_fwd activation to the merge device
+                #   3. continue — skip generic pipeline-forward
                 # ------------------------------------------------------
                 if role == "forward":
                     flops = self.layerFlops[layer_idx]
@@ -286,11 +290,9 @@ class Simulator:
                         flops / self.deviceComputeCapacity[device_idx]
                     )
 
-                    if task.task_id not in self.join_buffer:
-                        self.join_buffer[task.task_id] = {"forward": False, "backward": False}
-                    self.join_buffer[task.task_id]["forward"] = True
+                    # h_fwd activation size (same shape as the layer output)
+                    message_size = self.layersActivationSize[layer_idx]
 
-                    # Deliver task to the merge device for this LSTM group
                     merge_dev_idx = next(
                         (m for m, src in self.merge_sources.items() if src["forward"] == device_idx),
                         None
@@ -298,21 +300,27 @@ class Simulator:
                     if merge_dev_idx is not None:
                         merge_coord  = self.get_device_coord(merge_dev_idx)
                         merge_device = self.grid.nodes[merge_coord]["device"]
-                        message_size = self.layersActivationSize[layer_idx]
                         self.env.process(self.send_message(
                             task, device_coord, merge_coord, message_size, merge_device
                         ))
                         logging.info(
-                            f"Task {task.task_id}: forward {device_idx} -> merge {merge_dev_idx}"
+                            f"Task {task.task_id}: h_fwd sent from forward {device_idx} "
+                            f"-> merge {merge_dev_idx}  size={message_size}B"
                         )
                     continue
 
                 # ------------------------------------------------------
-                # LSTM BACKWARD branch
-                #   1. Compute
-                #   2. Flag join_buffer["backward"]
-                #   3. Do NOT send anything — forward handles merge delivery
-                #   4. continue (skip generic pipeline-forward)
+                # LSTM BACKWARD branch  (produces h_bwd)
+                #
+                # The backward pass processes the sequence right→left and
+                # produces hidden states h_bwd — a completely separate tensor
+                # from h_fwd.  The merge device needs this too, so backward
+                # ALSO sends its output activation to merge.
+                #
+                # Steps:
+                #   1. Compute h_bwd
+                #   2. Send h_bwd activation to the merge device
+                #   3. continue — skip generic pipeline-forward
                 # ------------------------------------------------------
                 elif role == "backward":
                     flops = self.layerFlops[layer_idx]
@@ -322,38 +330,75 @@ class Simulator:
                         flops / self.deviceComputeCapacity[device_idx]
                     )
 
-                    if task.task_id not in self.join_buffer:
-                        self.join_buffer[task.task_id] = {"forward": False, "backward": False}
-                    self.join_buffer[task.task_id]["backward"] = True
+                    # h_bwd activation size (same shape as h_fwd for a biLSTM)
+                    message_size = self.layersActivationSize[layer_idx]
 
-                    logging.info(
-                        f"Task {task.task_id}: backward {device_idx} done, flagged join_buffer"
+                    merge_dev_idx = next(
+                        (m for m, src in self.merge_sources.items() if src["backward"] == device_idx),
+                        None
                     )
+                    if merge_dev_idx is not None:
+                        merge_coord  = self.get_device_coord(merge_dev_idx)
+                        merge_device = self.grid.nodes[merge_coord]["device"]
+                        self.env.process(self.send_message(
+                            task, device_coord, merge_coord, message_size, merge_device
+                        ))
+                        logging.info(
+                            f"Task {task.task_id}: h_bwd sent from backward {device_idx} "
+                            f"-> merge {merge_dev_idx}  size={message_size}B"
+                        )
                     continue
 
                 # ------------------------------------------------------
-                # LSTM MERGE
-                #   1. Busy-wait until both forward and backward flags are set
-                #   2. Compute
-                #   3. Clean up join_buffer
-                #   4. Fall through to generic pipeline-forward
+                # LSTM MERGE  (combines h_fwd and h_bwd)
+                #
+                # The merge device receives TWO separate messages per task:
+                #   • h_fwd from the forward device
+                #   • h_bwd from the backward device
+                # It must collect both before it can compute the combined
+                # representation [h_fwd ; h_bwd] (concatenation / projection).
+                #
+                # Design: we use self.merge_buffer[task_id] as a per-task
+                # accumulator.  Each arriving message increments a counter;
+                # when the count reaches 2 the task is ready to compute.
+                # This is completely event-driven — no polling, no timeout.
+                #
+                # Because BOTH branches now send data, the merge device's
+                # input_queue naturally receives two TaskRecord objects for
+                # every original task (one from forward, one from backward).
+                # We treat the first arrival as a "partial" and the second
+                # as "complete", then proceed to compute.
                 # ------------------------------------------------------
                 elif role == "merge":
-                    while True:
-                        buf = self.join_buffer.get(task.task_id)
-                        if buf and buf["forward"] and buf["backward"]:
-                            break
-                        yield self.env.timeout(0.01)
+                    tid = task.task_id
 
+                    if tid not in self.merge_buffer:
+                        # First branch arrived — store it and wait for the second
+                        self.merge_buffer[tid] = 1
+                        logging.info(
+                            f"Task {tid}: merge {device_idx} got 1st branch at {self.env.now:.4f}, waiting"
+                        )
+                        # Do NOT proceed — loop back to get() the second message
+                        continue
+
+                    else:
+                        # Second branch arrived — both h_fwd and h_bwd are here
+                        del self.merge_buffer[tid]
+                        logging.info(
+                            f"Task {tid}: merge {device_idx} got 2nd branch at {self.env.now:.4f}, computing"
+                        )
+
+                    # Compute the merge operation (concat / projection)
+                    # The activation size is 2× a single branch because we
+                    # are concatenating h_fwd and h_bwd along the feature dim.
                     flops = self.layerFlops[layer_idx]
                     yield self.env.process(device.run(flops=flops))
                     self.stage_metrics_device[device_idx].tasks_processed += 1
                     self.stage_metrics_device[device_idx].busy_time += (
                         flops / self.deviceComputeCapacity[device_idx]
                     )
-                    del self.join_buffer[task.task_id]
                     logging.info(
-                        f"Task {task.task_id}: merge {device_idx} complete at {self.env.now:.4f}"
+                        f"Task {tid}: merge {device_idx} complete at {self.env.now:.4f}"
                     )
                     # Falls through to PIPELINE FORWARD below
 
@@ -372,17 +417,16 @@ class Simulator:
 
                 # ------------------------------------------------------
                 # PIPELINE FORWARD
-                # Three cases:
-                #   A) Fan-out device → send to BOTH forward and backward branches
-                #   B) Normal sequential device → send to next device
-                #   C) Last device → mark task complete
+                #   A) Fan-out device → send to BOTH forward and backward
+                #   B) Normal sequential → send to next device
+                #   C) Last device → task complete
                 # ------------------------------------------------------
                 message_size = self.layersActivationSize[layer_idx]
                 device_keys  = list(self.deviceToPartitionMapping.keys())
                 pos          = device_keys.index(device_idx)
 
                 if device_idx in self.lstm_groups:
-                    # Case A: fan-out — same task goes to both branches in parallel
+                    # Case A: fan-out — same task sent to both branches in parallel
                     grp = self.lstm_groups[device_idx]
                     for branch_key in ("forward", "backward"):
                         branch_dev_idx = grp[branch_key]
@@ -397,23 +441,10 @@ class Simulator:
                         ))
 
                 elif pos < len(device_keys) - 1:
-                    # Case B: normal sequential step — skip forward/backward devices
-                    # (they are handled exclusively via fan-out, not sequential indexing)
+                    # Case B: normal sequential step
                     next_device_idx = device_keys[pos + 1]
-                    next_role       = get_device_role(
-                        self.deviceToPartitionMapping[next_device_idx]
-                    )
-                    # If the next device in the ordered list is a forward/backward branch,
-                    # that means the current device IS the fan-out device but wasn't flagged
-                    # in lstm_groups — this shouldn't happen with correct config, but guard it.
-                    if next_role in ("forward", "backward"):
-                        logging.warning(
-                            f"Device {device_idx} sequential-next is a branch device "
-                            f"({next_device_idx}, role={next_role}). "
-                            f"Check device_to_partition config."
-                        )
-                    next_coord  = self.get_device_coord(next_device_idx)
-                    next_device = self.grid.nodes[next_coord]["device"]
+                    next_coord      = self.get_device_coord(next_device_idx)
+                    next_device     = self.grid.nodes[next_coord]["device"]
                     self.env.process(self.send_message(
                         task, device_coord, next_coord, message_size, next_device
                     ))
@@ -448,7 +479,6 @@ class Simulator:
         # ------------------------------------------------------------------
         self.env.process(task_generator())
 
-        # Start one worker per device that appears in the mapping
         for device_idx in sorted(self.deviceToPartitionMapping.keys()):
             self.env.process(device_worker(device_idx))
 
@@ -456,7 +486,6 @@ class Simulator:
 
     # ------------------------------------------------------------------
     def results(self) -> Dict:
-        """Return a summary dict with all key metrics. Call after simulate()."""
         completed = [r for r in self.task_records if r.completion_time > 0]
         print(f"Tasks completed: {len(completed)}")
         if not completed:

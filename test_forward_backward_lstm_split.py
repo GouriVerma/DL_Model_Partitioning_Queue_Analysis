@@ -56,9 +56,9 @@ if __name__ == "__main__":
 
     split_lstm_activations = []
     for shape in lstm_activation_shapes:
-        split_lstm_activations.append(shape)  # forward  output
-        split_lstm_activations.append(shape)  # backward output
-        split_lstm_activations.append(shape)  # merge    output
+        split_lstm_activations.append(shape)                              # forward output  = h_fwd
+        split_lstm_activations.append(shape)                              # backward output = h_bwd
+        split_lstm_activations.append([shape[0], shape[1], shape[2]*2])  # merge output   = [h_fwd ; h_bwd] (2x features)
 
     all_shapes      = conv_activation_shapes + split_lstm_activations
     layer_activation = [activation_size_bytes(s) for s in all_shapes]
