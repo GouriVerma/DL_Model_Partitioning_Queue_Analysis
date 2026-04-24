@@ -153,7 +153,7 @@ if __name__ == "__main__":
         deviceComputeCapacity    = device_caps,
         linksBandwidth           = links_bw,
         env                      = env,
-        arrival_rate             = 0.5,
+        arrival_rate             = 0.2,
         sim_duration             = sim_duration,
         sampling_interval        = 1,
     )
